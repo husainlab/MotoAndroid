@@ -1,0 +1,275 @@
+package com.husainlab.pillion.nativecore
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class PillionProtocolTest {
+  @Test
+  fun parsesMediaAndBatteryPackets() {
+    assertEquals(PillionPacket.Title("Nightcall"), PillionProtocol.parse("TITLE|Nightcall", false))
+    assertEquals(PillionPacket.Artist("Kavinsky"), PillionProtocol.parse("ARTIST|Kavinsky", false))
+    assertEquals(PillionPacket.Playing(true), PillionProtocol.parse("PLAYING|1", false))
+    assertEquals(PillionPacket.Battery(84, -1), PillionProtocol.parse("BATTERY|84", false))
+    assertEquals(PillionPacket.Battery(84, 42), PillionProtocol.parse("BATTERY|84|42", false))
+    assertEquals(PillionPacket.Volume(80), PillionProtocol.parse("VOLUME|80", false))
+    assertEquals(PillionPacket.Progress(12000L, 258000L), PillionProtocol.parse("PROGRESS|12000|258000", false))
+  }
+
+  @Test
+  fun parsesCommandsOnlyInSenderMode() {
+    assertEquals(PillionPacket.Command("/media/playpause"), PillionProtocol.parse("/media/playpause", true))
+    assertEquals(PillionPacket.Command("/call/dial|+15550199"), PillionProtocol.parse("/call/dial|+15550199", true))
+    assertNull(PillionProtocol.parse("/media/playpause", false))
+  }
+
+  @Test
+  fun parsesNotificationsLegacyAndReplyAware() {
+    val legacy = PillionProtocol.parse("NOTIF_ADD|k1|com.chat|Alex|Meet at 7 | Gate B", false)
+    assertTrue(legacy is PillionPacket.NotificationAdd)
+    val n1 = (legacy as PillionPacket.NotificationAdd).notification
+    assertEquals("k1", n1.key)
+    assertEquals("com.chat", n1.packageName)
+    assertEquals("Alex", n1.title)
+    assertEquals("Meet at 7 | Gate B", n1.text)
+    assertFalse(n1.canReply)
+
+    val replyable = PillionProtocol.parse("NOTIF_ADD2|k2|com.whatsapp|1|Sam|See you | soon", false)
+    assertTrue(replyable is PillionPacket.NotificationAdd)
+    val n2 = (replyable as PillionPacket.NotificationAdd).notification
+    assertEquals("k2", n2.key)
+    assertTrue(n2.canReply)
+    assertEquals("See you | soon", n2.text)
+    assertEquals(1, n2.messages.size)
+    assertEquals("See you | soon", n2.messages[0])
+
+    val multiText = PillionProtocol.parse(
+      "NOTIF_ADD2|k3|com.whatsapp|1|Sam|Hey%0AAre you free?%0ACall me when you reach",
+      false
+    )
+    assertTrue(multiText is PillionPacket.NotificationAdd)
+    val n3 = (multiText as PillionPacket.NotificationAdd).notification
+    assertEquals("k3", n3.key)
+    assertTrue(n3.canReply)
+    assertEquals("Hey\nAre you free?\nCall me when you reach", n3.text)
+    assertEquals(3, n3.messages.size)
+    assertEquals("Hey", n3.messages[0])
+    assertEquals("Are you free?", n3.messages[1])
+    assertEquals("Call me when you reach", n3.messages[2])
+  }
+
+  @Test
+  fun parsesCallContactsAndRecents() {
+    val incoming = PillionProtocol.parse("CALL_IN|Maya|+15551234", false) as PillionPacket.CallIncoming
+    assertEquals("Maya", incoming.caller)
+    assertEquals("+15551234", incoming.phoneNumber)
+
+    val contact = PillionProtocol.parse("CONTACT|42|Maya|+15551234|1", false) as PillionPacket.ContactItem
+    assertEquals("42", contact.contact.id)
+    assertEquals("Maya", contact.contact.name)
+    assertEquals("+15551234", contact.contact.phoneNumber)
+    assertTrue(contact.contact.isStarred)
+
+    val recent = PillionProtocol.parse("RECENT|r1|Maya|+15551234|3|1700000000000", false) as PillionPacket.RecentItem
+    assertEquals(3, recent.recent.callType)
+    assertEquals(1700000000000L, recent.recent.timestampMs)
+  }
+
+  @Test
+  fun roundTripsEscapedKeysWithSpecialCharacters() {
+    val raw = "0|com.whatsapp|1|null|1000|tag^with%and|pipe"
+    val escaped = PillionProtocol.escapeKey(raw)
+    assertFalse(escaped.contains("|"))
+    assertFalse(escaped.contains("\n"))
+    assertEquals(raw, PillionProtocol.unescapeKey(escaped))
+  }
+
+  @Test
+  fun classifiesCallNotificationCategoriesWithoutStaleFlips() {
+    assertEquals(
+      "CALL_ACTIVE",
+      PillionProtocol.classifyCallNotification("Ongoing call • 01:23", currentCallActive = false, currentCallIncoming = false)
+    )
+    assertEquals(
+      "CALL_ACTIVE",
+      PillionProtocol.classifyCallNotification("00:42", currentCallActive = false, currentCallIncoming = false)
+    )
+    assertEquals(
+      "CALL_ACTIVE",
+      PillionProtocol.classifyCallNotification("Call with Alex", currentCallActive = true, currentCallIncoming = false)
+    )
+    assertEquals(
+      "CALL_IN",
+      PillionProtocol.classifyCallNotification("Incoming call", currentCallActive = true, currentCallIncoming = true)
+    )
+    assertEquals(
+      "CALL_IN",
+      PillionProtocol.classifyCallNotification(null, currentCallActive = false, currentCallIncoming = false)
+    )
+
+    // Call ended phrases take precedence over timers and active flags
+    assertEquals(
+      "CALL_END",
+      PillionProtocol.classifyCallNotification("Call ended • 01:23", currentCallActive = true, currentCallIncoming = false)
+    )
+    assertEquals(
+      "CALL_END",
+      PillionProtocol.classifyCallNotification("Call disconnected", currentCallActive = true, currentCallIncoming = false)
+    )
+    assertEquals(
+      "CALL_END",
+      PillionProtocol.classifyCallNotification("01:23", currentCallActive = true, currentCallIncoming = false, titleHint = "Call ended")
+    )
+    assertEquals(
+      "CALL_END",
+      PillionProtocol.classifyCallNotification("Call rejected", currentCallActive = false, currentCallIncoming = true)
+    )
+    assertEquals(
+      "CALL_END",
+      PillionProtocol.classifyCallNotification("Missed call", currentCallActive = false, currentCallIncoming = true)
+    )
+  }
+
+  @Test
+  fun clampsOverlayCoordinatesCleanly() {
+    assertEquals(0, PillionProtocol.clampOverlayCoord(-20, 1000))
+    assertEquals(500, PillionProtocol.clampOverlayCoord(500, 1000))
+    assertEquals(1000, PillionProtocol.clampOverlayCoord(1400, 1000))
+    assertEquals(0, PillionProtocol.clampOverlayCoord(50, -10))
+  }
+
+  @Test
+  fun resetTransientStateClearsCallMediaAndNotifications() {
+    PillionStateStore.applyPacket("TITLE|Track A", false)
+    PillionStateStore.applyPacket("ARTIST|Artist A", false)
+    PillionStateStore.applyPacket("PLAYING|1", false)
+    PillionStateStore.applyPacket("BATTERY|65", false)
+    PillionStateStore.applyPacket("VOLUME|90", false)
+    PillionStateStore.applyPacket("CALL_IN|Maya|+15550000", false)
+    PillionStateStore.applyPacket("NOTIF_ADD2|k1|com.msg|1|Sam|Hey", false)
+
+    assertTrue(PillionStateStore.isCallActive)
+    assertTrue(PillionStateStore.isCallIncoming)
+    assertEquals(90, PillionStateStore.volumePercent)
+    assertEquals(1, PillionStateStore.getNotifications().size)
+
+    PillionStateStore.resetTransientState()
+
+    assertFalse(PillionStateStore.isCallActive)
+    assertFalse(PillionStateStore.isCallIncoming)
+    assertFalse(PillionStateStore.isCallMuted)
+    assertEquals(0L, PillionStateStore.callStartedAtMs)
+    assertFalse(PillionStateStore.isPlaying)
+    assertEquals(-1, PillionStateStore.batteryLevel)
+    assertEquals(70, PillionStateStore.volumePercent)
+    assertEquals("No Media Playing", PillionStateStore.songTitle)
+    assertTrue(PillionStateStore.getNotifications().isEmpty())
+    assertNull(PillionStateStore.lastNotification)
+  }
+
+  @Test
+  fun parsesCallMuteAndFormatsCallElapsed() {
+    assertEquals(PillionPacket.CallMute(true), PillionProtocol.parse("CALL_MUTE|1", false))
+    assertEquals(PillionPacket.CallMute(false), PillionProtocol.parse("CALL_MUTE|0", false))
+
+    assertEquals("00:00", PillionProtocol.formatCallElapsed(0L, 5000L))
+    assertEquals("00:00", PillionProtocol.formatCallElapsed(5000L, 4000L))
+    assertEquals("00:45", PillionProtocol.formatCallElapsed(1000L, 46_000L))
+    assertEquals("02:05", PillionProtocol.formatCallElapsed(1000L, 126_000L))
+    assertEquals("1:02:05", PillionProtocol.formatCallElapsed(1000L, 3_726_000L))
+
+    assertEquals("00:00", PillionProtocol.formatDurationMs(0L))
+    assertEquals("00:00", PillionProtocol.formatDurationMs(-100L))
+    assertEquals("01:15", PillionProtocol.formatDurationMs(75_000L))
+    assertEquals("1:01:15", PillionProtocol.formatDurationMs(3_675_000L))
+  }
+
+  @Test
+  fun tracksCallTimerAndMuteLifecycleAcrossPackets() {
+    PillionStateStore.resetTransientState()
+
+    PillionStateStore.applyPacket("CALL_IN|Maya|+15550000", false, nowMs = 500L)
+    assertTrue(PillionStateStore.isCallActive)
+    assertTrue(PillionStateStore.isCallIncoming)
+    assertFalse(PillionStateStore.isCallMuted)
+    assertEquals(0L, PillionStateStore.callStartedAtMs)
+
+    PillionStateStore.applyPacket("CALL_ACTIVE|Maya|+15550000", false, nowMs = 1000L)
+    assertTrue(PillionStateStore.isCallActive)
+    assertFalse(PillionStateStore.isCallIncoming)
+    assertEquals(1000L, PillionStateStore.callStartedAtMs)
+
+    PillionStateStore.applyPacket("CALL_MUTE|1", false, nowMs = 2000L)
+    assertTrue(PillionStateStore.isCallMuted)
+
+    PillionStateStore.applyPacket("CALL_ACTIVE|Maya|+15550000", false, nowMs = 5000L)
+    assertEquals(1000L, PillionStateStore.callStartedAtMs)
+    assertTrue(PillionStateStore.isCallMuted)
+
+    PillionStateStore.applyPacket("CALL_MUTE|0", false, nowMs = 6000L)
+    assertFalse(PillionStateStore.isCallMuted)
+
+    PillionStateStore.applyPacket("CALL_END", false, nowMs = 7000L)
+    assertFalse(PillionStateStore.isCallActive)
+    assertFalse(PillionStateStore.isCallIncoming)
+    assertFalse(PillionStateStore.isCallMuted)
+    assertEquals(0L, PillionStateStore.callStartedAtMs)
+  }
+
+  @Test
+  fun commitsContactsBatchAtomicallyAndCapsNotificationsAt40() {
+    PillionStateStore.resetTransientState()
+    PillionStateStore.applyPacket("CONTACTS_BEGIN", false)
+    PillionStateStore.applyPacket("CONTACT|1|Alice|+15550001|1", false)
+    PillionStateStore.applyPacket("CONTACT|2|Bob|+15550002|0", false)
+    PillionStateStore.applyPacket("CONTACTS_END", false)
+    assertEquals(2, PillionStateStore.getContacts().size)
+
+    for (i in 1..45) {
+      PillionStateStore.applyPacket("NOTIF_ADD2|k$i|com.app|0|Title $i|Body $i", false)
+    }
+    assertEquals(40, PillionStateStore.getNotifications().size)
+    PillionStateStore.resetTransientState()
+  }
+
+  @Test
+  fun tracksSessionScopedMissedCallsAndClearsWhenViewed() {
+    PillionStateStore.resetTransientState()
+    assertEquals(0, PillionStateStore.sessionMissedCalls)
+
+    // Historical recent missed call does NOT increase sessionMissedCalls
+    PillionStateStore.applyPacket("RECENTS_BEGIN", false)
+    PillionStateStore.applyPacket("RECENT|old1|Old Caller|+15559999|3|1600000000000", false)
+    PillionStateStore.applyPacket("RECENTS_END", false)
+    assertEquals(1, PillionStateStore.getRecentCalls().size)
+    assertEquals(0, PillionStateStore.sessionMissedCalls)
+
+    // CallMissed packet increments sessionMissedCalls
+    assertEquals(PillionPacket.CallMissed, PillionProtocol.parse("CALL_MISSED", false))
+    PillionStateStore.applyPacket("CALL_MISSED", false)
+    assertEquals(1, PillionStateStore.sessionMissedCalls)
+
+    // Ringing call that ends without answer increments sessionMissedCalls
+    PillionStateStore.applyPacket("CALL_IN|Bob|+15551234", false)
+    PillionStateStore.applyPacket("CALL_END", false)
+    assertEquals(2, PillionStateStore.sessionMissedCalls)
+
+    // Answered call does NOT increment sessionMissedCalls
+    PillionStateStore.applyPacket("CALL_IN|Alice|+15555678", false)
+    PillionStateStore.applyPacket("CALL_ACTIVE|Alice|+15555678", false)
+    PillionStateStore.applyPacket("CALL_END", false)
+    assertEquals(2, PillionStateStore.sessionMissedCalls)
+
+    // User views/acknowledges calls ("once done forget it")
+    PillionStateStore.clearSessionMissedCalls()
+    assertEquals(0, PillionStateStore.sessionMissedCalls)
+
+    // Disconnect/reset clears session missed calls
+    PillionStateStore.applyPacket("CALL_MISSED", false)
+    assertEquals(1, PillionStateStore.sessionMissedCalls)
+    PillionStateStore.resetTransientState()
+    assertEquals(0, PillionStateStore.sessionMissedCalls)
+  }
+}

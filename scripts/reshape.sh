@@ -60,11 +60,15 @@ fi
 payload-dumper-go -o extracted_images payload.bin
 
 # ------------------------------------------------------------------------------
-# 3. Download Latest Cockpit Receiver APK
+# 3. Resolve Cockpit Receiver APK (Local or Remote)
 # ------------------------------------------------------------------------------
-echo "[-] Downloading latest Cockpit Receiver APK..."
+echo "[-] Resolving Cockpit Receiver APK..."
 mkdir -p "${WORKDIR}/prebuilt"
-if ! curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_RELEASE_URL}"; then
+LOCAL_APK=$(find "${ROOT_DIR}/cockpit" -name "*release*.apk" ! -name "*unsigned*" 2>/dev/null | head -n 1 || true)
+if [[ -n "${LOCAL_APK}" && -f "${LOCAL_APK}" ]]; then
+    echo "[+] Found local Cockpit APK at ${LOCAL_APK}"
+    cp "${LOCAL_APK}" "${WORKDIR}/prebuilt/Cockpit.apk"
+elif ! curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_RELEASE_URL}"; then
     echo "[!] Primary URL failed, trying fallback URL..."
     curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_FALLBACK_URL}" || true
 fi

@@ -1,0 +1,1049 @@
+package com.husainlab.pillion.nativecore
+
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.CallLog
+import android.provider.ContactsContract
+import android.provider.Settings
+import android.telecom.TelecomManager
+import android.view.KeyEvent
+import androidx.core.app.ActivityCompat
+import expo.modules.kotlin.modules.Module
+import expo.modules.kotlin.modules.ModuleDefinition
+import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+class PillionNativeModule : Module() {
+  companion object {
+    private val APP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+    private const val PREFS_NAME = "pillion_native_prefs"
+    private const val PREF_LAST_DEVICE = "last_device"
+    private const val MAX_SYNC_CONTACTS = 250
+    private const val MAX_SYNC_RECENTS = 25
+
+    @Volatile var activeConnectedThread: Any? = null
+  }
+
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  private val mainHandler = Handler(Looper.getMainLooper())
+  @Volatile private var connectedThread: ConnectedThread? = null
+  private var reconnectJob: Job? = null
+  @Volatile private var autoReconnectEnabled = false
+  @Volatile private var isSenderMode = true
+  private val isConnecting = AtomicBoolean(false)
+  @Volatile private var serverAcceptJob: Job? = null
+  @Volatile private var activeServerSocket: BluetoothServerSocket? = null
+  @Volatile private var callWatchdogJob: Job? = null
+
+  @Volatile private var cachedNotifAccess: Boolean = false
+  @Volatile private var lastNotifAccessCheckMs: Long = 0L
+
+  @Volatile private var cachedRuntimePermissions: Boolean = false
+  @Volatile private var lastRuntimeCheckMs: Long = 0L
+
+  @Volatile private var bluetoothPanProxy: Any? = null
+
+  private val panProfileListener = object : BluetoothProfile.ServiceListener {
+    override fun onServiceConnected(profile: Int, proxy: BluetoothProfile?) {
+      if (profile == 5) { // 5 = BluetoothProfile.PAN
+        bluetoothPanProxy = proxy
+        PillionStateStore.notifyChanged()
+      }
+    }
+
+    override fun onServiceDisconnected(profile: Int) {
+      if (profile == 5) {
+        bluetoothPanProxy = null
+        PillionStateStore.notifyChanged()
+      }
+    }
+  }
+
+  private fun registerPanListener() {
+    try {
+      bluetoothAdapter?.getProfileProxy(context, panProfileListener, 5)
+    } catch (e: Exception) {
+      android.util.Log.w("Cockpit", "Failed to register PAN profile proxy: ${e.message}")
+    }
+  }
+
+  private fun unregisterPanListener() {
+    try {
+      val proxy = bluetoothPanProxy as? BluetoothProfile
+      if (proxy != null && bluetoothAdapter != null) {
+        bluetoothAdapter?.closeProfileProxy(5, proxy)
+      }
+    } catch (_: Exception) {}
+    bluetoothPanProxy = null
+  }
+
+  private fun isBluetoothTetheringActive(): Boolean {
+    val pan = bluetoothPanProxy ?: return false
+    return try {
+      val method = pan.javaClass.getMethod("isTetheringOn")
+      method.isAccessible = true
+      (method.invoke(pan) as? Boolean) ?: false
+    } catch (_: Exception) {
+      false
+    }
+  }
+
+  private fun setBluetoothTetheringState(enable: Boolean): Boolean {
+    val pan = bluetoothPanProxy ?: return false
+    return try {
+      val method = pan.javaClass.getMethod("setBluetoothTethering", Boolean::class.javaPrimitiveType)
+      method.isAccessible = true
+      method.invoke(pan, enable)
+      PillionStateStore.notifyChanged()
+      true
+    } catch (e: Exception) {
+      android.util.Log.w("Cockpit", "setBluetoothTethering failed: ${e.message}")
+      false
+    }
+  }
+
+  private fun openTetheringSettingsInternal() {
+    try {
+      val intent = Intent("android.settings.TETHER_SETTINGS").apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      context.startActivity(intent)
+    } catch (_: Exception) {
+      try {
+        val fallback = Intent(Settings.ACTION_WIRELESS_SETTINGS).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(fallback)
+      } catch (_: Exception) {}
+    }
+  }
+
+  private val safeContext: Context?
+    get() = appContext.reactContext?.applicationContext ?: appContext.reactContext
+
+  private val context: Context
+    get() = safeContext ?: throw IllegalStateException("React context unavailable")
+
+  private val bluetoothAdapter: BluetoothAdapter?
+    get() = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+
+  @Volatile private var stateChangePending = false
+  private val stateChangeRunnable = Runnable {
+    stateChangePending = false
+    try {
+      if (appContext.hasActiveReactInstance) {
+        sendEvent("onStateChange", buildSnapshotMap())
+      }
+    } catch (_: Throwable) {}
+  }
+
+  private val stateListener: () -> Unit = {
+    if (!stateChangePending) {
+      stateChangePending = true
+      mainHandler.postDelayed(stateChangeRunnable, 100L)
+    }
+  }
+
+  private fun invalidatePermissionCaches() {
+    lastNotifAccessCheckMs = 0L
+    lastRuntimeCheckMs = 0L
+  }
+
+  private fun hasNotificationAccessCached(): Boolean {
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastNotifAccessCheckMs > 3000L) {
+      cachedNotifAccess = hasNotificationAccess()
+      lastNotifAccessCheckMs = now
+    }
+    return cachedNotifAccess
+  }
+
+  private fun hasRequiredPermissionsCached(): Boolean {
+    val now = SystemClock.elapsedRealtime()
+    if (now - lastRuntimeCheckMs > 3000L) {
+      cachedRuntimePermissions = hasRequiredPermissions()
+      lastRuntimeCheckMs = now
+    }
+    return cachedRuntimePermissions
+  }
+
+  override fun definition() = ModuleDefinition {
+    Name("PillionNative")
+
+    Events("onStateChange")
+
+    OnCreate {
+      PillionStateStore.outgoingSender = { msg ->
+        val thread = connectedThread ?: (activeConnectedThread as? ConnectedThread)
+        thread?.write(msg.toByteArray())
+      }
+      PillionStateStore.commandExecutor = { cmd -> handleIncomingCommand(cmd) }
+      PillionStateStore.setModuleListener(stateListener)
+      registerPanListener()
+      startCallWatchdog()
+    }
+
+    OnDestroy {
+      mainHandler.removeCallbacks(stateChangeRunnable)
+      PillionStateStore.setModuleListener(null)
+      unregisterPanListener()
+      stopServerInternal()
+      reconnectJob?.cancel()
+      callWatchdogJob?.cancel()
+      scope.cancel()
+    }
+
+    AsyncFunction("getSnapshot") {
+      invalidatePermissionCaches()
+      buildSnapshotMap()
+    }
+
+    AsyncFunction("getPairedDevices") {
+      getPairedDevicesList()
+    }
+
+    AsyncFunction("requestRuntimePermissions") {
+      invalidatePermissionCaches()
+      hasRequiredPermissions()
+    }
+
+    AsyncFunction("openNotificationListenerSettings") {
+      invalidatePermissionCaches()
+      val intent = Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS").apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      context.startActivity(intent)
+    }
+
+    AsyncFunction("openOverlaySettings") {
+      // Receiver overlay stripped on primary phone
+    }
+
+    AsyncFunction("startServer") {
+      isSenderMode = true
+      autoReconnectEnabled = false
+      reconnectJob?.cancel()
+      reconnectJob = null
+      startCallWatchdog()
+      startServerInternal()
+    }
+
+    AsyncFunction("stopServer") {
+      stopServerInternal()
+    }
+
+    AsyncFunction("setRelayRole") { mode: String ->
+      isSenderMode = mode == "sender"
+      if (isSenderMode) {
+        startCallWatchdog()
+        autoReconnectEnabled = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+      } else {
+        stopCallWatchdog()
+      }
+      PillionStateStore.notifyChanged()
+    }
+
+    AsyncFunction("connectToDevice") { address: String ->
+      isSenderMode = false
+      if (PillionStateStore.isServerRunning) {
+        stopServerInternal()
+      }
+      autoReconnectEnabled = true
+      context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(PREF_LAST_DEVICE, address)
+        .apply()
+      closeCurrentConnection("Connecting...")
+      startReconnectLoop(initialDelayMs = 5000L)
+      connectByAddress(address)
+    }
+
+    AsyncFunction("disconnect") {
+      autoReconnectEnabled = false
+      closeCurrentConnection("Disconnected")
+    }
+
+    AsyncFunction("setAutoReconnect") { enabled: Boolean ->
+      autoReconnectEnabled = enabled
+      if (enabled && !isSenderMode) {
+        startReconnectLoop(initialDelayMs = 0L)
+      } else if (!enabled) {
+        reconnectJob?.cancel()
+        reconnectJob = null
+      }
+    }
+
+    AsyncFunction("isBluetoothTetheringOn") {
+      isBluetoothTetheringActive()
+    }
+
+    AsyncFunction("setBluetoothTethering") { enable: Boolean ->
+      setBluetoothTetheringState(enable)
+    }
+
+    AsyncFunction("openTetheringSettings") {
+      openTetheringSettingsInternal()
+    }
+
+    AsyncFunction("startOverlay") {
+      false
+    }
+
+    AsyncFunction("stopOverlay") {
+      // Receiver overlay stripped on primary phone
+    }
+
+    AsyncFunction("setAutoStartOverlay") { _: Boolean ->
+      // Receiver overlay stripped on primary phone
+    }
+
+    AsyncFunction("setKeepScreenAwake") { enabled: Boolean ->
+      context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean("keep_screen_awake", enabled)
+        .apply()
+      val intent = Intent("com.husainlab.pillion.ACTION_UPDATE_KEEP_AWAKE").apply {
+        putExtra("keepAwake", enabled)
+        setPackage(context.packageName)
+      }
+      context.sendBroadcast(intent)
+    }
+
+    AsyncFunction("sendCommand") { path: String ->
+      PillionStateStore.sendMessage(path)
+    }
+
+    AsyncFunction("syncContacts") {
+      if (isSenderMode) {
+        scope.launch { syncContactsAndRecents() }
+      } else {
+        PillionStateStore.sendMessage("/sync/contacts")
+      }
+    }
+
+    AsyncFunction("launchGoogleMaps") { _: Boolean ->
+      false
+    }
+  }
+
+  private fun hasRequiredPermissions(): Boolean {
+    val permissions = mutableListOf<String>()
+    permissions.add(Manifest.permission.READ_PHONE_STATE)
+    permissions.add(Manifest.permission.READ_CALL_LOG)
+    permissions.add(Manifest.permission.READ_CONTACTS)
+    permissions.add(Manifest.permission.CALL_PHONE)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      permissions.add(Manifest.permission.ANSWER_PHONE_CALLS)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+      permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+      permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    return permissions.all {
+      ActivityCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+    }
+  }
+
+  private fun hasNotificationAccess(): Boolean {
+    val cn = ComponentName(context, PillionNotificationListener::class.java)
+    val flat = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+    return flat != null && flat.contains(cn.flattenToString())
+  }
+
+  private fun getPairedDevicesList(): List<Map<String, String>> {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+      ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+    ) {
+      return emptyList()
+    }
+    return try {
+      bluetoothAdapter?.bondedDevices?.map { device ->
+        mapOf(
+          "name" to (device.name ?: device.address),
+          "address" to device.address
+        )
+      } ?: emptyList()
+    } catch (_: SecurityException) {
+      emptyList()
+    }
+  }
+
+  private fun closeCurrentConnection(nextStatus: String) {
+    val previous = connectedThread ?: (activeConnectedThread as? ConnectedThread)
+    connectedThread = null
+    activeConnectedThread = null
+    previous?.cancel()
+    PillionStateStore.resetTransientState()
+    updateStatus(nextStatus)
+  }
+
+  private fun startCallWatchdog() {
+    if (callWatchdogJob?.isActive == true) return
+    callWatchdogJob = scope.launch {
+      val telecom = safeContext?.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+      val telephony = safeContext?.getSystemService(Context.TELEPHONY_SERVICE) as? android.telephony.TelephonyManager
+      while (isActive) {
+        delay(1000L)
+        if (!isSenderMode) continue
+        if (PillionStateStore.isCallActive) {
+          var isActuallyInCall = false
+          try {
+            val ctx = safeContext
+            val hasPhonePermission = ctx != null && ActivityCompat.checkSelfPermission(
+              ctx,
+              Manifest.permission.READ_PHONE_STATE
+            ) == PackageManager.PERMISSION_GRANTED
+            if (hasPhonePermission) {
+              val telecomInCall = try { telecom?.isInCall == true } catch (_: Exception) { false }
+              val telephonyInCall = try {
+                telephony?.callState != android.telephony.TelephonyManager.CALL_STATE_IDLE
+              } catch (_: Exception) { false }
+              isActuallyInCall = telecomInCall || telephonyInCall
+            } else {
+              isActuallyInCall = try { telecom?.isInCall == true } catch (_: Exception) { false }
+            }
+          } catch (_: Exception) {}
+
+          if (!isActuallyInCall) {
+            PillionStateStore.isCallActive = false
+            PillionStateStore.isCallIncoming = false
+            PillionStateStore.callStartedAtMs = 0L
+            PillionStateStore.callerName = ""
+            PillionStateStore.callerNumber = ""
+            PillionStateStore.sendMessage("CALL_END")
+            PillionStateStore.notifyChanged()
+          }
+        }
+      }
+    }
+  }
+
+  private fun stopCallWatchdog() {
+    callWatchdogJob?.cancel()
+    callWatchdogJob = null
+  }
+
+  private fun startServerInternal() {
+    if (PillionStateStore.isServerRunning) return
+    startCallWatchdog()
+    val adapter = bluetoothAdapter
+    if (adapter == null) {
+      updateStatus("Bluetooth unavailable")
+      return
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+      ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+    ) {
+      updateStatus("Permission denied")
+      return
+    }
+
+    PillionStateStore.isServerRunning = true
+    PillionStateStore.notifyChanged()
+
+    serverAcceptJob = scope.launch {
+      try {
+        while (PillionStateStore.isServerRunning && isActive) {
+          val serverSocket = activeServerSocket ?: try {
+            bluetoothAdapter?.listenUsingRfcommWithServiceRecord("Pillion", APP_UUID)?.also {
+              activeServerSocket = it
+            }
+          } catch (_: Exception) {
+            null
+          }
+
+          if (serverSocket == null) {
+            updateStatus("Server Error")
+            delay(2000)
+            continue
+          }
+
+          updateStatus("Waiting for connection...")
+          val socket = try {
+            serverSocket.accept()
+          } catch (_: IOException) {
+            if (PillionStateStore.isServerRunning) {
+              updateStatus("Server Error")
+              try {
+                activeServerSocket?.close()
+              } catch (_: Exception) {}
+              activeServerSocket = null
+              delay(2000)
+              continue
+            } else {
+              break
+            }
+          }
+          socket?.let { accepted ->
+            manageConnectedSocket(accepted)
+            while (connectedThread?.isAlive == true && PillionStateStore.isServerRunning && isActive) {
+              delay(1000)
+            }
+          }
+        }
+      } catch (_: Exception) {
+        PillionStateStore.resetTransientState()
+        updateStatus("Server failed")
+        PillionStateStore.isServerRunning = false
+        PillionStateStore.notifyChanged()
+      } finally {
+        try {
+          activeServerSocket?.close()
+        } catch (_: IOException) {}
+        activeServerSocket = null
+      }
+    }
+  }
+
+  private fun stopServerInternal() {
+    stopCallWatchdog()
+    PillionStateStore.isServerRunning = false
+    try {
+      activeServerSocket?.close()
+    } catch (_: IOException) {}
+    activeServerSocket = null
+    serverAcceptJob?.cancel()
+    serverAcceptJob = null
+    closeCurrentConnection("Server Stopped")
+  }
+
+  private fun attemptConnectSocket(address: String, connectingStatus: String) {
+    val adapter = bluetoothAdapter ?: run {
+      updateStatus("Bluetooth unavailable")
+      return
+    }
+    if (!isConnecting.compareAndSet(false, true)) return
+    var socket: BluetoothSocket? = null
+    try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+        ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+      ) {
+        updateStatus("Permission denied")
+        return
+      }
+      try {
+        adapter.cancelDiscovery()
+      } catch (_: SecurityException) {}
+      updateStatus(connectingStatus)
+      val device: BluetoothDevice = adapter.getRemoteDevice(address)
+      val created = device.createRfcommSocketToServiceRecord(APP_UUID)
+      socket = created
+      created.connect()
+      manageConnectedSocket(created)
+      socket = null
+    } catch (_: IOException) {
+      try { socket?.close() } catch (_: Exception) {}
+      updateStatus("Disconnected")
+    } catch (_: SecurityException) {
+      try { socket?.close() } catch (_: Exception) {}
+      updateStatus("Permission denied")
+    } catch (_: IllegalArgumentException) {
+      try { socket?.close() } catch (_: Exception) {}
+      updateStatus("Disconnected")
+    } finally {
+      isConnecting.set(false)
+    }
+  }
+
+  private fun connectByAddress(address: String) {
+    scope.launch {
+      if (PillionStateStore.connectionStatus == "Connected") return@launch
+      attemptConnectSocket(address, "Connecting...")
+    }
+  }
+
+  private fun startReconnectLoop(initialDelayMs: Long = 0L) {
+    if (reconnectJob?.isActive == true) return
+    reconnectJob = scope.launch {
+      if (initialDelayMs > 0L) {
+        delay(initialDelayMs)
+      }
+      while (isActive) {
+        if (autoReconnectEnabled && !isSenderMode && connectedThread == null && !isConnecting.get()) {
+          val address = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_LAST_DEVICE, null)
+          if (address != null && bluetoothAdapter != null) {
+            attemptConnectSocket(address, "Auto-reconnecting...")
+          }
+        }
+        delay(5000)
+      }
+    }
+  }
+
+  private fun manageConnectedSocket(socket: BluetoothSocket) {
+    val previous = connectedThread ?: (activeConnectedThread as? ConnectedThread)
+    val nextThread = ConnectedThread(socket)
+    connectedThread = nextThread
+    activeConnectedThread = nextThread
+    previous?.cancel()
+    nextThread.start()
+    updateStatus("Connected")
+    context.sendBroadcast(Intent(PillionProtocol.ACTION_SYNC))
+    // Automatically enable Bluetooth Tethering to relay internet to Cockpit OS
+    setBluetoothTetheringState(true)
+    scope.launch {
+      delay(350)
+      syncContactsAndRecents()
+    }
+  }
+
+  private fun normalizePhoneKey(raw: String): String =
+    raw.filter { it.isDigit() || it == '+' }.takeLast(10)
+
+  private fun syncContactsAndRecents() {
+    val contacts = readDeviceContacts()
+    val recents = readRecentCalls()
+
+    PillionStateStore.setContacts(contacts)
+    PillionStateStore.setRecentCalls(recents)
+    PillionStateStore.notifyChanged()
+
+    if (connectedThread == null) return
+
+    PillionStateStore.sendMessage("CONTACTS_BEGIN")
+    for (c in contacts) {
+      val starredFlag = if (c.isStarred) "1" else "0"
+      PillionStateStore.sendMessage(
+        "CONTACT|${PillionProtocol.sanitizeField(c.id)}|${PillionProtocol.sanitizeField(c.name)}|${PillionProtocol.sanitizeField(c.phoneNumber)}|$starredFlag"
+      )
+    }
+    PillionStateStore.sendMessage("CONTACTS_END")
+
+    PillionStateStore.sendMessage("RECENTS_BEGIN")
+    for (r in recents) {
+      PillionStateStore.sendMessage(
+        "RECENT|${PillionProtocol.sanitizeField(r.id)}|${PillionProtocol.sanitizeField(r.name)}|${PillionProtocol.sanitizeField(r.phoneNumber)}|${r.callType}|${r.timestampMs}"
+      )
+    }
+    PillionStateStore.sendMessage("RECENTS_END")
+  }
+
+  private fun readDeviceContacts(): List<SyncedContact> {
+    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+      return emptyList()
+    }
+    val results = mutableListOf<SyncedContact>()
+    val seenKeys = HashSet<String>()
+    val projection = arrayOf(
+      ContactsContract.CommonDataKinds.Phone._ID,
+      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+      ContactsContract.CommonDataKinds.Phone.NUMBER,
+      ContactsContract.CommonDataKinds.Phone.STARRED
+    )
+    val sortOrder = "${ContactsContract.CommonDataKinds.Phone.STARRED} DESC, ${ContactsContract.CommonDataKinds.Phone.TIMES_CONTACTED} DESC, ${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+
+    try {
+      context.contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        projection,
+        null,
+        null,
+        sortOrder
+      )?.use { cursor ->
+        val idxId = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone._ID)
+        val idxName = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+        val idxNum = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        val idxStar = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.STARRED)
+
+        while (cursor.moveToNext() && results.size < MAX_SYNC_CONTACTS) {
+          val rawNum = cursor.getString(idxNum)?.trim() ?: continue
+          val key = normalizePhoneKey(rawNum)
+          if (key.length < 3 || !seenKeys.add(key)) continue
+          val id = if (idxId >= 0) cursor.getString(idxId) ?: "$key-${results.size}" else "$key-${results.size}"
+          val name = (if (idxName >= 0) cursor.getString(idxName) else null)?.trim().orEmpty().ifEmpty { rawNum }
+          val starred = idxStar >= 0 && cursor.getInt(idxStar) == 1
+          results.add(SyncedContact(id = id, name = name, phoneNumber = rawNum, isStarred = starred))
+        }
+      }
+    } catch (_: Exception) {}
+    return results
+  }
+
+  private fun readRecentCalls(): List<RecentCallEntry> {
+    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+      return emptyList()
+    }
+    val results = mutableListOf<RecentCallEntry>()
+    val projection = arrayOf(
+      CallLog.Calls._ID,
+      CallLog.Calls.CACHED_NAME,
+      CallLog.Calls.NUMBER,
+      CallLog.Calls.TYPE,
+      CallLog.Calls.DATE
+    )
+    try {
+      context.contentResolver.query(
+        CallLog.Calls.CONTENT_URI,
+        projection,
+        null,
+        null,
+        "${CallLog.Calls.DATE} DESC"
+      )?.use { cursor ->
+        val idxId = cursor.getColumnIndex(CallLog.Calls._ID)
+        val idxName = cursor.getColumnIndex(CallLog.Calls.CACHED_NAME)
+        val idxNum = cursor.getColumnIndex(CallLog.Calls.NUMBER)
+        val idxType = cursor.getColumnIndex(CallLog.Calls.TYPE)
+        val idxDate = cursor.getColumnIndex(CallLog.Calls.DATE)
+
+        while (cursor.moveToNext() && results.size < MAX_SYNC_RECENTS) {
+          val num = cursor.getString(idxNum)?.trim().orEmpty()
+          if (num.isEmpty()) continue
+          val id = if (idxId >= 0) cursor.getString(idxId) ?: "${results.size}" else "${results.size}"
+          val name = (if (idxName >= 0) cursor.getString(idxName) else null)?.trim().orEmpty().ifEmpty { num }
+          val callType = if (idxType >= 0) cursor.getInt(idxType) else CallLog.Calls.INCOMING_TYPE
+          val dateMs = if (idxDate >= 0) cursor.getLong(idxDate) else 0L
+          results.add(
+            RecentCallEntry(
+              id = id,
+              name = name,
+              phoneNumber = num,
+              callType = callType,
+              timestampMs = dateMs
+            )
+          )
+        }
+      }
+    } catch (_: Exception) {}
+    return results
+  }
+
+  private fun lookupDisplayName(number: String): String {
+    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+      return number
+    }
+    return try {
+      val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number))
+      context.contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) cursor.getString(0) ?: number else number
+      } ?: number
+    } catch (_: Exception) {
+      number
+    }
+  }
+
+  private fun placeOutgoingCall(rawNumber: String) {
+    val clean = rawNumber.trim()
+    if (clean.isEmpty()) return
+    if (ActivityCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+      return
+    }
+    val uri = Uri.fromParts("tel", clean, null)
+    val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+    val display = PillionProtocol.sanitizeField(lookupDisplayName(clean))
+    PillionStateStore.sendMessage("CALL_ACTIVE|$display|${PillionProtocol.sanitizeField(clean)}")
+
+    try {
+      telecomManager.placeCall(uri, Bundle())
+    } catch (_: Exception) {
+      try {
+        val intent = Intent(Intent.ACTION_CALL, uri).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+      } catch (_: Exception) {}
+    }
+  }
+
+  private fun updateStatus(status: String) {
+    PillionStateStore.connectionStatus = status
+    PillionStateStore.notifyChanged()
+  }
+
+  private fun handleIncomingCommand(path: String) {
+    val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    try {
+      when {
+        path == "/call/answer" -> {
+          val answeredByNotif = PillionStateStore.callActionFallbackHandler?.invoke(true) == true
+          if (!answeredByNotif &&
+            ActivityCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED
+          ) {
+            @Suppress("DEPRECATION")
+            telecomManager.acceptRingingCall()
+          }
+          PillionStateStore.isCallActive = true
+          PillionStateStore.isCallIncoming = false
+          if (PillionStateStore.callStartedAtMs <= 0L) {
+            PillionStateStore.callStartedAtMs = System.currentTimeMillis()
+          }
+          val name = PillionStateStore.callerName.ifEmpty { "Active Call" }
+          val num = PillionStateStore.callerNumber
+          PillionStateStore.sendMessage("CALL_ACTIVE|$name|$num")
+          PillionStateStore.notifyChanged()
+        }
+        path == "/call/decline" || path == "/call/end" -> {
+          var ended = false
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            ActivityCompat.checkSelfPermission(context, Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED
+          ) {
+            @Suppress("DEPRECATION")
+            ended = telecomManager.endCall()
+          }
+          if (!ended) {
+            PillionStateStore.callActionFallbackHandler?.invoke(false)
+          }
+          try {
+            audioManager.isMicrophoneMute = false
+          } catch (_: Exception) {}
+          PillionStateStore.isCallMuted = false
+          PillionStateStore.isCallActive = false
+          PillionStateStore.isCallIncoming = false
+          PillionStateStore.callStartedAtMs = 0L
+          PillionStateStore.callerName = ""
+          PillionStateStore.callerNumber = ""
+          PillionStateStore.sendMessage("CALL_MUTE|0")
+          PillionStateStore.sendMessage("CALL_END")
+          PillionStateStore.notifyChanged()
+        }
+        path == "/call/mute" -> {
+          val nextMuted = !audioManager.isMicrophoneMute
+          try {
+            audioManager.isMicrophoneMute = nextMuted
+          } catch (_: Exception) {}
+          PillionStateStore.isCallMuted = nextMuted
+          PillionStateStore.notifyChanged()
+          PillionStateStore.sendMessage("CALL_MUTE|${if (nextMuted) "1" else "0"}")
+        }
+        path == "/call/clear_missed" -> {
+          PillionStateStore.clearSessionMissedCalls()
+        }
+        path.startsWith("/call/mute|") -> {
+          val nextMuted = path.removePrefix("/call/mute|") == "1"
+          try {
+            audioManager.isMicrophoneMute = nextMuted
+          } catch (_: Exception) {}
+          PillionStateStore.isCallMuted = nextMuted
+          PillionStateStore.notifyChanged()
+          PillionStateStore.sendMessage("CALL_MUTE|${if (nextMuted) "1" else "0"}")
+        }
+        path.startsWith("/call/dial|") -> {
+          val number = path.removePrefix("/call/dial|")
+          placeOutgoingCall(number)
+        }
+        path == "/sync/contacts" -> {
+          scope.launch { syncContactsAndRecents() }
+        }
+        path.startsWith("/notif/dismiss|") -> {
+          val key = path.removePrefix("/notif/dismiss|")
+          PillionStateStore.notificationDismissHandler?.invoke(key)
+        }
+        path.startsWith("/notif/reply|") -> {
+          val payload = path.removePrefix("/notif/reply|")
+          val sep = payload.indexOf('|')
+          if (sep > 0) {
+            val key = payload.substring(0, sep)
+            val replyText = payload.substring(sep + 1)
+            PillionStateStore.notificationReplyHandler?.invoke(key, replyText)
+          }
+        }
+        path == "/media/playpause" -> {
+          audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE))
+          audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE))
+        }
+        path == "/media/next" -> {
+          audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_NEXT))
+          audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_NEXT))
+        }
+        path == "/media/prev" -> {
+          audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PREVIOUS))
+          audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PREVIOUS))
+        }
+        path.startsWith("/media/seek|") -> {
+          val targetMs = path.removePrefix("/media/seek|").toLongOrNull() ?: 0L
+          PillionStateStore.progressMs = targetMs
+          PillionStateStore.mediaSeekHandler?.invoke(targetMs)
+          PillionStateStore.notifyChanged()
+        }
+        path.startsWith("/volume/set|") -> {
+          val targetPct = path.removePrefix("/volume/set|").toIntOrNull()?.coerceIn(0, 100) ?: 70
+          val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+          val targetIndex = (targetPct * max / 100.0).roundToInt().coerceIn(0, max)
+          audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetIndex, AudioManager.FLAG_SHOW_UI)
+          val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+          val actualPct = if (max > 0) (cur * 100) / max else targetPct
+          PillionStateStore.volumePercent = actualPct
+          PillionStateStore.sendMessage("VOLUME|$actualPct")
+          PillionStateStore.notifyChanged()
+        }
+        path == "/volume/up" -> {
+          audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+          val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+          val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+          val pct = if (max > 0) (cur * 100) / max else 0
+          PillionStateStore.volumePercent = pct
+          PillionStateStore.sendMessage("VOLUME|$pct")
+          PillionStateStore.notifyChanged()
+        }
+        path == "/volume/down" -> {
+          audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+          val cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+          val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+          val pct = if (max > 0) (cur * 100) / max else 0
+          PillionStateStore.volumePercent = pct
+          PillionStateStore.sendMessage("VOLUME|$pct")
+          PillionStateStore.notifyChanged()
+        }
+      }
+    } catch (e: SecurityException) {
+      android.util.Log.w("Pillion", "Permission denied executing command '$path': ${e.message}")
+      PillionStateStore.notifyChanged()
+    } catch (e: Exception) {
+      android.util.Log.e("Pillion", "Error executing command '$path'", e)
+    }
+  }
+
+  private fun buildSnapshotMap(): Map<String, Any?> = mapOf(
+    "connectionStatus" to PillionStateStore.connectionStatus,
+    "isServerRunning" to PillionStateStore.isServerRunning,
+    "isOverlayRunning" to PillionStateStore.isOverlayRunning,
+    "songTitle" to PillionStateStore.songTitle,
+    "artistName" to PillionStateStore.artistName,
+    "isPlaying" to PillionStateStore.isPlaying,
+    "progressMs" to PillionStateStore.progressMs.toDouble(),
+    "durationMs" to PillionStateStore.durationMs.toDouble(),
+    "volumePercent" to PillionStateStore.volumePercent,
+    "batteryLevel" to PillionStateStore.batteryLevel,
+    "batteryTempC" to PillionStateStore.batteryTempC,
+    "currentSpeedKmh" to 0.0,
+    "isBluetoothTetheringOn" to isBluetoothTetheringActive(),
+    "isCallActive" to PillionStateStore.isCallActive,
+    "isCallIncoming" to PillionStateStore.isCallIncoming,
+    "isCallMuted" to PillionStateStore.isCallMuted,
+    "callStartedAtMs" to PillionStateStore.callStartedAtMs.toDouble(),
+    "callerName" to PillionStateStore.callerName,
+    "callerNumber" to PillionStateStore.callerNumber,
+    "sessionMissedCalls" to PillionStateStore.sessionMissedCalls,
+    "notifications" to PillionStateStore.getNotifications().map {
+      mapOf(
+        "key" to it.key,
+        "packageName" to it.packageName,
+        "title" to it.title,
+        "text" to it.text,
+        "receivedAt" to it.receivedAt.toDouble(),
+        "canReply" to it.canReply,
+        "messages" to it.messages
+      )
+    },
+    "contacts" to PillionStateStore.getContacts().map {
+      mapOf(
+        "id" to it.id,
+        "name" to it.name,
+        "phoneNumber" to it.phoneNumber,
+        "isStarred" to it.isStarred
+      )
+    },
+    "recentCalls" to PillionStateStore.getRecentCalls().map {
+      mapOf(
+        "id" to it.id,
+        "name" to it.name,
+        "phoneNumber" to it.phoneNumber,
+        "callType" to it.callType,
+        "timestampMs" to it.timestampMs.toDouble()
+      )
+    },
+    "hasNotificationAccess" to hasNotificationAccessCached(),
+    "hasOverlayPermission" to false,
+    "hasRuntimePermissions" to hasRequiredPermissionsCached()
+  )
+
+  private inner class ConnectedThread(private val socket: BluetoothSocket) : Thread() {
+    private val mmInStream: InputStream = socket.inputStream
+    private val mmOutStream: OutputStream = socket.outputStream
+    private val writeQueue = LinkedBlockingQueue<ByteArray>(1024)
+    private val closed = AtomicBoolean(false)
+    private val writerThread = Thread {
+      while (!closed.get()) {
+        try {
+          val frame = writeQueue.poll(500, TimeUnit.MILLISECONDS) ?: continue
+          mmOutStream.write(frame)
+          mmOutStream.write('\n'.code)
+          mmOutStream.flush()
+        } catch (_: InterruptedException) {
+          break
+        } catch (_: IOException) {
+          break
+        }
+      }
+    }.apply {
+      name = "PillionSppWriter"
+      isDaemon = true
+    }
+
+    override fun run() {
+      try {
+        writerThread.start()
+        val reader = mmInStream.bufferedReader()
+        while (!closed.get()) {
+          val line = reader.readLine() ?: break
+          if (line.isNotEmpty()) {
+            PillionStateStore.applyPacket(line, isSenderMode)
+          }
+        }
+      } catch (_: IOException) {
+      } finally {
+        cancel()
+        if (connectedThread === this || activeConnectedThread === this) {
+          connectedThread = null
+          activeConnectedThread = null
+          PillionStateStore.resetTransientState()
+          updateStatus("Disconnected")
+        }
+      }
+    }
+
+    fun write(bytes: ByteArray) {
+      if (closed.get()) return
+      val accepted = writeQueue.offer(bytes.copyOf())
+      if (!accepted) {
+        android.util.Log.w("Pillion", "SPP write queue full — frame dropped (${bytes.size} bytes)")
+      }
+    }
+
+    fun cancel() {
+      if (!closed.compareAndSet(false, true)) return
+      writerThread.interrupt()
+      try {
+        socket.close()
+      } catch (_: IOException) {}
+    }
+  }
+}

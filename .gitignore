@@ -1,0 +1,23 @@
+# Build and temporary workdirs
+build_workdir/
+out/
+extracted_images/
+*.img
+*.zip
+*.tar.gz
+
+# Node / Expo / Android dependencies
+node_modules/
+.expo/
+dist/
+web-build/
+.kotlin/
+*.orig.*
+.vitest/
+*.db
+cockpit/node_modules/
+cockpit/.expo/
+cockpit/dist/
+cockpit/android/
+cockpit/ios/
+cockpit/modules/*/android/build/

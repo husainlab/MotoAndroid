@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Expo / CNG generated native directories
+/android
+/ios
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+.kotlin/
+*.orig.*
+.vitest/
+*.db
+modules/*/android/build/
+*.apk
+
+# Keystores (release.keystore is committed intentionally to keep consistent APK updates)
+credentials/*.jks
+credentials/*.pem
+credentials/*.key
+
+# Local / OS / TypeScript
+.DS_Store
+*.tsbuildinfo
+.env*.local
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+pnpm-debug.*
