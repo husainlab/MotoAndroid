@@ -1,6 +1,6 @@
 {
   "name": "cockpit",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "main": "index.ts",
   "private": true,
   "packageManager": "pnpm@12.16.1",

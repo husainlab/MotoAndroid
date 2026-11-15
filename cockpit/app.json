@@ -2,7 +2,7 @@
   "expo": {
     "name": "Cockpit",
     "slug": "cockpit",
-    "version": "1.0.10",
+    "version": "1.0.11",
     "orientation": "default",
     "platforms": [
       "android"
@@ -14,7 +14,7 @@
     "userInterfaceStyle": "automatic",
     "android": {
       "package": "com.husainlab.cockpit",
-      "versionCode": 11,
+      "versionCode": 12,
       "predictiveBackGestureEnabled": true,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
