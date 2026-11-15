@@ -15,9 +15,12 @@ web-build/
 *.orig.*
 .vitest/
 *.db
+.DS_Store
+*.DS_Store
 cockpit/node_modules/
 cockpit/.expo/
 cockpit/dist/
 cockpit/android/
 cockpit/ios/
 cockpit/modules/*/android/build/
+

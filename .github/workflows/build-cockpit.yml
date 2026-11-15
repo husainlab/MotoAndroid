@@ -2,6 +2,11 @@ name: Build MotoCockpit OS
 
 on:
   push:
+    paths:
+      - 'config/**'
+      - 'device/**'
+      - 'scripts/**'
+      - '.github/workflows/build-cockpit.yml'
     branches: [main]
   workflow_dispatch:
 
