@@ -55,7 +55,7 @@ jobs:
           NOTES="### MotoCockpit OS for Motorola Moto G52 (rhode)
           
           * **Base:** Official LineageOS Android 14 / 21
-          * **Embedded Cockpit:** Pillion Cockpit Appliance
+          * **Embedded Cockpit:** Cockpit Receiver Appliance
           * **Hardware Tuning:** 60Hz AMOLED lock, 3GB zstd ZRAM, Wi-Fi & Bluetooth-only mode
           * **Debloated:** All telephony/SMS bloat, Aperture camera, Eleven music, and stock trackers removed.
           
@@ -67,3 +67,4 @@ jobs:
           gh release create "${TAG_NAME}" out/*.zip out/*.sha256 \
             --title "${RELEASE_TITLE}" \
             --notes "${NOTES}"
+

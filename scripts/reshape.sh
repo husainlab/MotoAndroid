@@ -13,8 +13,8 @@ WORKDIR="${ROOT_DIR}/build_workdir"
 OUTDIR="${ROOT_DIR}/out"
 
 LINEAGE_API_URL="https://download.lineageos.org/api/v2/devices/rhode/builds"
-PILLION_RELEASE_URL="https://github.com/husainlab/Pillion/releases/latest/download/Pillion-release.apk"
-PILLION_FALLBACK_URL="https://github.com/husainlab/Bike_Companion_app/releases/latest/download/Pillion-release.apk"
+COCKPIT_RELEASE_URL="https://github.com/husainlab/Cockpit/releases/latest/download/Cockpit-release.apk"
+COCKPIT_FALLBACK_URL="https://github.com/husainlab/Bike_Companion_app/releases/latest/download/Cockpit-release.apk"
 
 echo "========================================================"
 echo "    MotoCockpit OS - ROM Reshaping Pipeline Starting    "
@@ -60,16 +60,18 @@ fi
 payload-dumper-go -o extracted_images payload.bin
 
 # ------------------------------------------------------------------------------
-# 3. Download Latest Pillion Release APK
+# 3. Download Latest Cockpit Receiver APK
 # ------------------------------------------------------------------------------
-echo "[-] Downloading latest Pillion Cockpit APK..."
+echo "[-] Downloading latest Cockpit Receiver APK..."
 mkdir -p "${WORKDIR}/prebuilt"
-if ! curl -sL -f -o "${WORKDIR}/prebuilt/Pillion.apk" "${PILLION_RELEASE_URL}"; then
+if ! curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_RELEASE_URL}"; then
     echo "[!] Primary URL failed, trying fallback URL..."
-    curl -sL -f -o "${WORKDIR}/prebuilt/Pillion.apk" "${PILLION_FALLBACK_URL}"
+    curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_FALLBACK_URL}" || true
 fi
 
-echo "[+] Pillion APK size: $(wc -c < "${WORKDIR}/prebuilt/Pillion.apk") bytes"
+if [[ -f "${WORKDIR}/prebuilt/Cockpit.apk" ]]; then
+    echo "[+] Cockpit APK size: $(wc -c < "${WORKDIR}/prebuilt/Cockpit.apk") bytes"
+fi
 
 # ------------------------------------------------------------------------------
 # 4. Modify System & Product Partitions
@@ -139,11 +141,11 @@ apply_partition_mods() {
         fi
     done < "${ROOT_DIR}/config/debloat_blacklist.txt"
 
-    if [[ "${PART}" == "system" ]]; then
-        echo "[-] Injecting Pillion into /system/priv-app/Pillion/..."
-        sudo mkdir -p "${TARGET_DIR}/system/priv-app/Pillion"
-        sudo cp "${WORKDIR}/prebuilt/Pillion.apk" "${TARGET_DIR}/system/priv-app/Pillion/Pillion.apk"
-        sudo chmod 644 "${TARGET_DIR}/system/priv-app/Pillion/Pillion.apk"
+    if [[ "${PART}" == "system" ]] && [[ -f "${WORKDIR}/prebuilt/Cockpit.apk" ]]; then
+        echo "[-] Injecting Cockpit into /system/priv-app/Cockpit/..."
+        sudo mkdir -p "${TARGET_DIR}/system/priv-app/Cockpit"
+        sudo cp "${WORKDIR}/prebuilt/Cockpit.apk" "${TARGET_DIR}/system/priv-app/Cockpit/Cockpit.apk"
+        sudo chmod 644 "${TARGET_DIR}/system/priv-app/Cockpit/Cockpit.apk"
 
         echo "[-] Injecting privapp-permissions-cockpit.xml..."
         sudo mkdir -p "${TARGET_DIR}/system/etc/permissions"
@@ -237,3 +239,4 @@ echo "    MotoCockpit OS Package Created Successfully!        "
 echo "    Artifact: ${OUTDIR}/${PACKAGE_NAME}.zip             "
 echo "    SHA256:   $(cat "${OUTDIR}/${PACKAGE_NAME}.zip.sha256")"
 echo "========================================================"
+

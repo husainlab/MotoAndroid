@@ -1,18 +1,18 @@
-# MotoCockpit OS (Motorola Moto G52 // rhode)
+# Cockpit OS (Motorola Moto G52 // rhode)
 
 [![Build & Release OS](https://github.com/husainlab/MotoAndroid/actions/workflows/build-cockpit.yml/badge.svg)](https://github.com/husainlab/MotoAndroid/actions/workflows/build-cockpit.yml)
 [![Target Device](https://img.shields.io/badge/Device-Moto%20G52%20(rhode)-FF5A1F)](https://wiki.lineageos.org/devices/rhode/)
 [![Base](https://img.shields.io/badge/Base-LineageOS%2021-00E575)](https://github.com/LineageOS/android)
 
-An automated, ultra-lean, single-purpose Android cockpit appliance operating system designed specifically for the **Motorola Moto G52 (`rhode`)** motorcycle handlebar mount, powered by **[Pillion](https://github.com/husainlab/Pillion)** and live navigation.
+An automated, ultra-lean, single-purpose Android cockpit appliance operating system designed specifically for the **Motorola Moto G52 (`rhode`)** motorcycle handlebar mount, powered by **Cockpit** and live navigation.
 
 ---
 
 ## Key Hardware & OS Optimizations
 
 * **AMOLED 60Hz Lock:** Hardcoded in framework overlay and SurfaceFlinger (`config_defaultPeakRefreshRate = 60`). Eliminates 90Hz display controller thermal spikes and saves ~18–22% battery in direct sunlight.
-* **3GB `zstd` ZRAM:** Replaced standard `lz4` with `zstd` (3.2:1 compression ratio) and set ZRAM disk size to 75% in `fstab.qcom` and `init.mmi.rc`. Over 2.8 GB of clean, free physical RAM for Google Maps and Pillion.
-* **Embedded Pillion System Appliance:** Automatically injects the latest signed release of [husainlab/Pillion](https://github.com/husainlab/Pillion) into `/system/priv-app/Pillion/` with platform permissions pre-whitelisted (`privapp-permissions-cockpit.xml`). No manual "Draw over other apps" or background location prompts on first boot.
+* **3GB `zstd` ZRAM:** Replaced standard `lz4` with `zstd` (3.2:1 compression ratio) and set ZRAM disk size to 75% in `fstab.qcom` and `init.mmi.rc`. Over 2.8 GB of clean, free physical RAM for Google Maps and Cockpit.
+* **Embedded Cockpit System Appliance:** Automatically injects the latest signed release of Cockpit into `/system/priv-app/Cockpit/` with platform permissions pre-whitelisted (`privapp-permissions-cockpit.xml`). No manual "Draw over other apps" or background location prompts on first boot.
 * **Wi-Fi & Bluetooth-Only Appliance:** Disabled cellular baseband searching (`ro.radio.noril=yes`, `ro.carrier=wifi-only`). Radio modem DSP sleeps permanently, eliminating cell tower polling battery drain.
 * **Aggressive Debloat:** Stripped Aperture camera, Eleven music, Jelly browser, Calculator, Calendar, DeskClock, PrintSpooler, SIM Toolkit, and CellBroadcastReceiver.
 
@@ -45,5 +45,6 @@ This repository uses automated **ROM Image Reshaping** inside `.github/workflows
 1. Fetches the latest signed base LineageOS build for `rhode`.
 2. Extracts partition images via `payload-dumper-go`.
 3. Prunes blacklisted bloatware from `system`, `product`, and `system_ext`.
-4. Injects Pillion, permissions whitelist, 60Hz overrides, and ZRAM properties.
+4. Injects Cockpit, permissions whitelist, 60Hz overrides, and ZRAM properties.
 5. Repacks partitions, packages the fastboot installer, and publishes a new GitHub Release in under 5 minutes.
+

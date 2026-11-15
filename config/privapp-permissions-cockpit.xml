@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Privileged permissions whitelist for Pillion Cockpit Appliance
+  Privileged permissions whitelist for Cockpit OS Appliance
   Location: /system/etc/permissions/privapp-permissions-cockpit.xml
 -->
 <permissions>
-    <privapp-permissions package="com.husainlab.pillion">
+    <privapp-permissions package="com.husainlab.cockpit">
         <!-- Overlay & Window Management -->
         <permission name="android.permission.SYSTEM_ALERT_WINDOW" />
         <permission name="android.permission.INTERNAL_SYSTEM_WINDOW" />
@@ -40,3 +40,4 @@
         <permission name="android.permission.BATTERY_STATS" />
     </privapp-permissions>
 </permissions>
+
