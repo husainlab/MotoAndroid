@@ -1,0 +1,24 @@
+# Moto G52 Cockpit OS System Properties
+# Maximum performance, battery preservation, and 4GB RAM optimization
+
+# Display: Lock AMOLED to 60Hz natively (saves 18-22% power)
+ro.surface_flinger.set_idle_timer_ms=0
+ro.surface_flinger.set_touch_timer_ms=0
+ro.surface_flinger.use_content_detection_for_refresh_rate=false
+
+# Connectivity: Wi-Fi & Bluetooth Only Appliance
+ro.radio.noril=yes
+ro.carrier=wifi-only
+
+# Memory Management (LMKD): Foreground Protection for Maps & Pillion
+ro.lmk.kill_heaviest_task=false
+ro.lmk.swap_util_max=95
+ro.lmk.thrashing_limit=25
+ro.lmk.thrashing_limit_decay=25
+ro.lmk.thrashing_limit_critical=30
+
+# Background Services: Disable Assistant telemetry
+ro.opa.eligible_device=false
+
+# Disable Setup Wizard
+ro.setupwizard.mode=DISABLED

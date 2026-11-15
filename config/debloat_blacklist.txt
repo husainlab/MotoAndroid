@@ -1,0 +1,30 @@
+# Cockpit OS Debloat Blacklist
+# These apps are removed to free RAM, eliminate background wakelocks, and streamline cockpit UI.
+
+# Default LineageOS User Apps
+app/Aperture
+app/Eleven
+app/Jelly
+app/Etar
+app/ExactCalculator
+app/Recorder
+app/LineageGallery
+app/DeskClock
+priv-app/Seedvault
+priv-app/ThemePicker
+app/LiveWallpapersPicker
+
+# Unnecessary Telephony & SIM Services (Wi-Fi/Bluetooth Cockpit)
+app/CellBroadcastReceiver
+app/Stk
+app/EmergencyInfo
+app/WAPPushManager
+app/CompanionDeviceManager
+priv-app/InCallUI
+priv-app/Telecom
+
+# Diagnostic, Print & Logging Bloat
+app/PrintSpooler
+priv-app/CMBugReport
+priv-app/LineageUpdater
+app/Tag

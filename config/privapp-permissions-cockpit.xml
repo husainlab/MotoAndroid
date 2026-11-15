@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Privileged permissions whitelist for Pillion Cockpit Appliance
+  Location: /system/etc/permissions/privapp-permissions-cockpit.xml
+-->
+<permissions>
+    <privapp-permissions package="com.husainlab.pillion">
+        <!-- Overlay & Window Management -->
+        <permission name="android.permission.SYSTEM_ALERT_WINDOW" />
+        <permission name="android.permission.INTERNAL_SYSTEM_WINDOW" />
+        <permission name="android.permission.SYSTEM_APPLICATION_OVERLAY" />
+        
+        <!-- GNSS & Telemetry -->
+        <permission name="android.permission.ACCESS_FINE_LOCATION" />
+        <permission name="android.permission.ACCESS_COARSE_LOCATION" />
+        <permission name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+        
+        <!-- Bluetooth Classic RFCOMM / SPP & PAN -->
+        <permission name="android.permission.BLUETOOTH" />
+        <permission name="android.permission.BLUETOOTH_ADMIN" />
+        <permission name="android.permission.BLUETOOTH_CONNECT" />
+        <permission name="android.permission.BLUETOOTH_SCAN" />
+        <permission name="android.permission.BLUETOOTH_PRIVILEGED" />
+        
+        <!-- Audio & Call Telemetry Sync -->
+        <permission name="android.permission.MODIFY_AUDIO_SETTINGS" />
+        <permission name="android.permission.READ_PHONE_STATE" />
+        <permission name="android.permission.READ_CALL_LOG" />
+        <permission name="android.permission.POST_NOTIFICATIONS" />
+        
+        <!-- Foreground Execution & System Controls -->
+        <permission name="android.permission.WAKE_LOCK" />
+        <permission name="android.permission.FOREGROUND_SERVICE" />
+        <permission name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+        <permission name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+        <permission name="android.permission.REQUEST_INSTALL_PACKAGES" />
+        <permission name="android.permission.CHANGE_WIFI_STATE" />
+        <permission name="android.permission.WRITE_SETTINGS" />
+        <permission name="android.permission.WRITE_SECURE_SETTINGS" />
+        <permission name="android.permission.BATTERY_STATS" />
+    </privapp-permissions>
+</permissions>
