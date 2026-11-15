@@ -1,31 +1,50 @@
 # Cockpit OS Debloat Blacklist
-# These apps are removed to free RAM, eliminate background wakelocks, and streamline cockpit UI.
+# These packages are removed to free RAM, eliminate thermal-generating wakelocks,
+# permanently kill Setup Wizard, and guarantee Cockpit is the sole system launcher.
 
-# Default LineageOS User Apps
-app/Aperture
-app/Eleven
-app/Jelly
-app/Etar
-app/ExactCalculator
-app/Recorder
-app/LineageGallery
-app/DeskClock
-priv-app/Seedvault
-priv-app/ThemePicker
-app/LiveWallpapersPicker
+# 1. Setup Wizards (Mandatory removal - boots straight to launcher)
+LineageSetupWizard
+SetupWizard
+GoogleSetupWizard
+ManagedProvisioning
 
-# Unnecessary Telephony & SIM Services (Wi-Fi/Bluetooth Cockpit)
-app/CellBroadcastReceiver
-app/Stk
-app/EmergencyInfo
-app/WAPPushManager
-app/CompanionDeviceManager
-priv-app/InCallUI
-priv-app/Telecom
+# 2. Stock Launchers (Removed so Cockpit is the sole Home launcher)
+Trebuchet
+TrebuchetQuickStep
+Launcher3
+Launcher3QuickStep
+NexusLauncherRelease
 
-# Diagnostic, Print & Logging Bloat
-app/PrintSpooler
-priv-app/CMBugReport
-priv-app/LineageUpdater
-app/Tag
+# 3. Default LineageOS Apps (Unneeded on a motorcycle cockpit)
+Aperture
+Eleven
+Jelly
+Etar
+ExactCalculator
+Recorder
+LineageGallery
+DeskClock
+Seedvault
+ThemePicker
+LiveWallpapersPicker
+WallpaperBackup
 
+# 4. Telephony & SIM Bloat (Handlebar unit is Wi-Fi/Bluetooth only)
+CellBroadcastReceiver
+Stk
+EmergencyInfo
+WAPPushManager
+CompanionDeviceManager
+InCallUI
+Telecom
+TelephonyProvider
+Messaging
+Dialer
+CarrierDefaultApp
+
+# 5. Diagnostic, Print & Logging Bloat
+PrintSpooler
+CMBugReport
+LineageUpdater
+Tag
+Feedback

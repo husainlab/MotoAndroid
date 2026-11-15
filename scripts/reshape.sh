@@ -13,8 +13,8 @@ WORKDIR="${ROOT_DIR}/build_workdir"
 OUTDIR="${ROOT_DIR}/out"
 
 LINEAGE_API_URL="https://download.lineageos.org/api/v2/devices/rhode/builds"
-COCKPIT_RELEASE_URL="https://github.com/husainlab/Cockpit/releases/latest/download/Cockpit-release.apk"
-COCKPIT_FALLBACK_URL="https://github.com/husainlab/Bike_Companion_app/releases/latest/download/Cockpit-release.apk"
+COCKPIT_RELEASE_URL="https://github.com/husainlab/MotoAndroid/releases/latest/download/Cockpit-release.apk"
+COCKPIT_FALLBACK_URL="https://github.com/husainlab/MotoAndroid/releases/download/app-v1.0.11/Cockpit-release.apk"
 
 echo "========================================================"
 echo "    MotoCockpit OS - ROM Reshaping Pipeline Starting    "
@@ -64,21 +64,33 @@ payload-dumper-go -o extracted_images payload.bin
 # ------------------------------------------------------------------------------
 echo "[-] Resolving Cockpit Receiver APK..."
 mkdir -p "${WORKDIR}/prebuilt"
-LOCAL_APK=$(find "${ROOT_DIR}/cockpit" -name "*release*.apk" ! -name "*unsigned*" 2>/dev/null | head -n 1 || true)
-if [[ -n "${LOCAL_APK}" && -f "${LOCAL_APK}" ]]; then
-    echo "[+] Found local Cockpit APK at ${LOCAL_APK}"
-    cp "${LOCAL_APK}" "${WORKDIR}/prebuilt/Cockpit.apk"
-elif ! curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_RELEASE_URL}"; then
-    echo "[!] Primary URL failed, trying fallback URL..."
-    curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_FALLBACK_URL}" || true
+
+if [[ -f "${WORKDIR}/prebuilt/Cockpit.apk" && -s "${WORKDIR}/prebuilt/Cockpit.apk" ]]; then
+    echo "[+] Using existing ${WORKDIR}/prebuilt/Cockpit.apk"
+else
+    LOCAL_APK=$(find "${ROOT_DIR}/cockpit" -name "*release*.apk" ! -name "*unsigned*" 2>/dev/null | head -n 1 || true)
+    if [[ -n "${LOCAL_APK}" && -f "${LOCAL_APK}" ]]; then
+        echo "[+] Found local Cockpit APK at ${LOCAL_APK}"
+        cp "${LOCAL_APK}" "${WORKDIR}/prebuilt/Cockpit.apk"
+    elif curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_RELEASE_URL}"; then
+        echo "[+] Downloaded Cockpit APK from ${COCKPIT_RELEASE_URL}"
+    else
+        echo "[!] Primary download failed, attempting fallback URL: ${COCKPIT_FALLBACK_URL}..."
+        curl -sL -f -o "${WORKDIR}/prebuilt/Cockpit.apk" "${COCKPIT_FALLBACK_URL}" || true
+    fi
 fi
 
-if [[ -f "${WORKDIR}/prebuilt/Cockpit.apk" ]]; then
-    echo "[+] Cockpit APK size: $(wc -c < "${WORKDIR}/prebuilt/Cockpit.apk") bytes"
+# Hard validation: The build MUST fail if Cockpit.apk is not present or empty
+if [[ ! -f "${WORKDIR}/prebuilt/Cockpit.apk" || ! -s "${WORKDIR}/prebuilt/Cockpit.apk" ]]; then
+    echo "[!] CRITICAL FAILURE: Cockpit.apk could not be resolved!"
+    echo "[!] Cannot produce MotoCockpit OS without the Cockpit appliance APK."
+    exit 1
 fi
+
+echo "[+] Confirmed Cockpit APK: size=$(wc -c < "${WORKDIR}/prebuilt/Cockpit.apk") bytes"
 
 # ------------------------------------------------------------------------------
-# 4. Modify System & Product Partitions
+# 4. Modify System, System_Ext & Product Partitions
 # ------------------------------------------------------------------------------
 echo "[-] Preparing partition modification environment..."
 
@@ -92,7 +104,10 @@ modify_partition() {
         return 0
     fi
 
+    echo "========================================================"
     echo "[-] Processing partition: ${PART_NAME}..."
+    echo "========================================================"
+    rm -rf "${EXTRACT_DIR}"
     mkdir -p "${EXTRACT_DIR}"
 
     # Check filesystem type (EROFS or EXT4)
@@ -102,11 +117,12 @@ modify_partition() {
     if [[ "${FS_TYPE}" == "erofs" ]] || file "${IMG_FILE}" | grep -q "erofs"; then
         echo "[+] Detected EROFS filesystem on ${PART_NAME}."
         if command -v fsck.erofs &>/dev/null; then
-            fsck.erofs --extract="${EXTRACT_DIR}" "${IMG_FILE}" || true
+            fsck.erofs --extract="${EXTRACT_DIR}" "${IMG_FILE}"
         elif command -v extract.erofs &>/dev/null; then
-            extract.erofs -i "${IMG_FILE}" -x "${EXTRACT_DIR}" || true
+            extract.erofs -i "${IMG_FILE}" -x "${EXTRACT_DIR}"
         else
-            echo "[!] No EROFS extraction tool found."
+            echo "[!] Error: No EROFS extraction tool found."
+            exit 1
         fi
         
         # Apply Modifications
@@ -130,53 +146,109 @@ modify_partition() {
         sudo resize2fs -M "${IMG_FILE}" || true
     fi
 
-    echo "[+] Finished processing ${PART_NAME}."
+    echo "[+] Finished processing partition: ${PART_NAME}."
 }
 
 apply_partition_mods() {
     local PART="$1"
     local TARGET_DIR="$2"
 
-    echo "[-] Debloating ${PART}..."
+    echo "[-] Debloating ${PART} in ${TARGET_DIR}..."
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Ignore comments and empty lines
-        [[ "$line" =~ ^#.*$ ]] && continue
-        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+        local TARGET_NAME
+        TARGET_NAME=$(basename "$line" | tr -d '\r')
+        [[ -z "$TARGET_NAME" ]] && continue
 
-        local APP_PATH="${TARGET_DIR}/${line}"
-        if [[ -e "${APP_PATH}" ]]; then
-            echo "    [x] Removing ${line}"
-            sudo rm -rf "${APP_PATH}"
-        fi
+        # Aggressively remove matching packages across directory tree
+        sudo find "${TARGET_DIR}" -maxdepth 5 \( -type d -o -type f \) -iname "${TARGET_NAME}" -exec rm -rf {} + 2>/dev/null || true
+        sudo find "${TARGET_DIR}" -maxdepth 5 \( -type d -o -type f \) -iname "${TARGET_NAME}.apk" -exec rm -rf {} + 2>/dev/null || true
     done < "${ROOT_DIR}/config/debloat_blacklist.txt"
 
-    if [[ "${PART}" == "system" ]] && [[ -f "${WORKDIR}/prebuilt/Cockpit.apk" ]]; then
-        echo "[-] Injecting Cockpit into /system/priv-app/Cockpit/..."
-        sudo mkdir -p "${TARGET_DIR}/system/priv-app/Cockpit"
-        sudo cp "${WORKDIR}/prebuilt/Cockpit.apk" "${TARGET_DIR}/system/priv-app/Cockpit/Cockpit.apk"
-        sudo chmod 644 "${TARGET_DIR}/system/priv-app/Cockpit/Cockpit.apk"
+    # Aggressive purge of Setup Wizard and Stock Launchers across all partitions
+    echo "[-] Purging all SetupWizard, Trebuchet, and Launcher3 traces in ${PART}..."
+    sudo find "${TARGET_DIR}" -maxdepth 5 \( -type d -o -type f \) -iname "*SetupWizard*" -exec rm -rf {} + 2>/dev/null || true
+    sudo find "${TARGET_DIR}" -maxdepth 5 \( -type d -o -type f \) -iname "*Trebuchet*" -exec rm -rf {} + 2>/dev/null || true
+    sudo find "${TARGET_DIR}" -maxdepth 5 \( -type d -o -type f \) -iname "*Launcher3*" -exec rm -rf {} + 2>/dev/null || true
 
-        echo "[-] Injecting privapp-permissions-cockpit.xml..."
-        sudo mkdir -p "${TARGET_DIR}/system/etc/permissions"
-        sudo cp "${ROOT_DIR}/config/privapp-permissions-cockpit.xml" "${TARGET_DIR}/system/etc/permissions/privapp-permissions-cockpit.xml"
-        sudo chmod 644 "${TARGET_DIR}/system/etc/permissions/privapp-permissions-cockpit.xml"
-
-        echo "[-] Appending Cockpit system properties to build.prop..."
-        if [[ -f "${TARGET_DIR}/system/build.prop" ]]; then
-            sudo cat "${ROOT_DIR}/config/cockpit.prop" | sudo tee -a "${TARGET_DIR}/system/build.prop" > /dev/null
+    # Inject Cockpit APK, permissions, and default-permissions into system partition
+    if [[ "${PART}" == "system" ]]; then
+        echo "[-] Injecting Cockpit Appliance into ${PART} priv-app..."
+        local PRIV_DIRS=()
+        [[ -d "${TARGET_DIR}/system/priv-app" ]] && PRIV_DIRS+=("${TARGET_DIR}/system/priv-app")
+        [[ -d "${TARGET_DIR}/priv-app" ]] && PRIV_DIRS+=("${TARGET_DIR}/priv-app")
+        if [[ ${#PRIV_DIRS[@]} -eq 0 ]]; then
+            if [[ -d "${TARGET_DIR}/system" ]]; then
+                PRIV_DIRS+=("${TARGET_DIR}/system/priv-app")
+            else
+                PRIV_DIRS+=("${TARGET_DIR}/priv-app")
+            fi
         fi
+
+        for PRIV_DIR in "${PRIV_DIRS[@]}"; do
+            echo "    -> Injecting into ${PRIV_DIR}/Cockpit/Cockpit.apk"
+            sudo mkdir -p "${PRIV_DIR}/Cockpit"
+            sudo cp "${WORKDIR}/prebuilt/Cockpit.apk" "${PRIV_DIR}/Cockpit/Cockpit.apk"
+            sudo chmod 755 "${PRIV_DIR}/Cockpit"
+            sudo chmod 644 "${PRIV_DIR}/Cockpit/Cockpit.apk"
+        done
+
+        # Inject Privileged Permissions
+        echo "[-] Injecting privapp-permissions-cockpit.xml..."
+        local PERM_DIRS=()
+        [[ -d "${TARGET_DIR}/system/etc/permissions" ]] && PERM_DIRS+=("${TARGET_DIR}/system/etc/permissions")
+        [[ -d "${TARGET_DIR}/etc/permissions" ]] && PERM_DIRS+=("${TARGET_DIR}/etc/permissions")
+        if [[ ${#PERM_DIRS[@]} -eq 0 ]]; then
+            if [[ -d "${TARGET_DIR}/system" ]]; then
+                PERM_DIRS+=("${TARGET_DIR}/system/etc/permissions")
+            else
+                PERM_DIRS+=("${TARGET_DIR}/etc/permissions")
+            fi
+        fi
+
+        for PERM_DIR in "${PERM_DIRS[@]}"; do
+            echo "    -> Injecting into ${PERM_DIR}/privapp-permissions-cockpit.xml"
+            sudo mkdir -p "${PERM_DIR}"
+            sudo cp "${ROOT_DIR}/config/privapp-permissions-cockpit.xml" "${PERM_DIR}/privapp-permissions-cockpit.xml"
+            sudo chmod 644 "${PERM_DIR}/privapp-permissions-cockpit.xml"
+        done
+
+        # Inject Default Permissions (pre-grant location, bluetooth, phone)
+        echo "[-] Injecting default-permissions-cockpit.xml..."
+        local DEF_PERM_DIRS=()
+        [[ -d "${TARGET_DIR}/system/etc/default-permissions" ]] && DEF_PERM_DIRS+=("${TARGET_DIR}/system/etc/default-permissions")
+        [[ -d "${TARGET_DIR}/etc/default-permissions" ]] && DEF_PERM_DIRS+=("${TARGET_DIR}/etc/default-permissions")
+        if [[ ${#DEF_PERM_DIRS[@]} -eq 0 ]]; then
+            if [[ -d "${TARGET_DIR}/system" ]]; then
+                DEF_PERM_DIRS+=("${TARGET_DIR}/system/etc/default-permissions")
+            else
+                DEF_PERM_DIRS+=("${TARGET_DIR}/etc/default-permissions")
+            fi
+        fi
+
+        for DEF_PERM_DIR in "${DEF_PERM_DIRS[@]}"; do
+            echo "    -> Injecting into ${DEF_PERM_DIR}/default-permissions-cockpit.xml"
+            sudo mkdir -p "${DEF_PERM_DIR}"
+            sudo cp "${ROOT_DIR}/config/default-permissions-cockpit.xml" "${DEF_PERM_DIR}/default-permissions-cockpit.xml"
+            sudo chmod 644 "${DEF_PERM_DIR}/default-permissions-cockpit.xml"
+        done
     fi
 
-    if [[ "${PART}" == "product" ]]; then
-        if [[ -f "${TARGET_DIR}/build.prop" ]]; then
-            echo "ro.setupwizard.mode=DISABLED" | sudo tee -a "${TARGET_DIR}/build.prop" > /dev/null
-        fi
+    # Inject cockpit system properties into all build.prop & prop.default files found
+    echo "[-] Appending Cockpit properties to build.prop in ${PART}..."
+    local PROP_FILES
+    PROP_FILES=$(sudo find "${TARGET_DIR}" -type f \( -name "build.prop" -o -name "prop.default" \) 2>/dev/null || true)
+    if [[ -n "${PROP_FILES}" ]]; then
+        for PROP_FILE in ${PROP_FILES}; do
+            echo "    -> Appending cockpit.prop to ${PROP_FILE}"
+            sudo cat "${ROOT_DIR}/config/cockpit.prop" | sudo tee -a "${PROP_FILE}" > /dev/null
+        done
     fi
 }
 
 modify_partition "system"
-modify_partition "product"
 modify_partition "system_ext"
+modify_partition "product"
 
 # ------------------------------------------------------------------------------
 # 5. Package Fastboot Cockpit OS Distribution
@@ -184,6 +256,7 @@ modify_partition "system_ext"
 echo "[-] Creating Fastboot Cockpit OS Flashable Package..."
 PACKAGE_NAME="MotoCockpit-OS-v1.0.0-rhode"
 DIST_DIR="${WORKDIR}/${PACKAGE_NAME}"
+rm -rf "${DIST_DIR}"
 mkdir -p "${DIST_DIR}"
 
 cp extracted_images/boot.img "${DIST_DIR}/"
@@ -202,17 +275,37 @@ set -e
 echo "================================================="
 echo "   Flashing MotoCockpit OS to Motorola Moto G52  "
 echo "================================================="
+
+# Verify device in bootloader
+if ! fastboot devices | grep -q "[a-zA-Z0-9]"; then
+    echo "[!] Error: No device detected in fastboot mode."
+    echo "[!] Put Moto G52 into bootloader (Hold Volume Down + Power) and connect USB."
+    exit 1
+fi
+
+echo "[-] Flashing bootloader & kernel images..."
 fastboot flash boot boot.img
 fastboot flash dtbo dtbo.img
 fastboot flash vendor_boot vendor_boot.img
-fastboot flash --disable-verity --disable-verification vbmeta vbmeta.img || true
+fastboot flash vbmeta vbmeta.img
+
+echo "[-] Rebooting into userspace fastbootd..."
 fastboot reboot fastboot
+sleep 5
+
+echo "[-] Flashing dynamic system partitions..."
 fastboot flash system system.img
 fastboot flash product product.img
 fastboot flash system_ext system_ext.img
 fastboot flash vendor vendor.img
-echo "[+] Flash complete. Wipe userdata if performing first-time install: fastboot -w"
-echo "[+] Rebooting to Cockpit OS..."
+
+echo "[-] Wiping userdata for clean appliance launch..."
+fastboot -w || true
+
+echo "================================================="
+echo "[+] MotoCockpit OS flash complete!"
+echo "[+] Rebooting into Cockpit OS..."
+echo "================================================="
 fastboot reboot
 EOF
 chmod +x "${DIST_DIR}/flash-all.sh"
@@ -222,22 +315,36 @@ cat << 'EOF' > "${DIST_DIR}/flash-all.bat"
 echo =================================================
 echo    Flashing MotoCockpit OS to Motorola Moto G52  
 echo =================================================
+
+echo [-] Flashing bootloader & kernel images...
 fastboot flash boot boot.img
 fastboot flash dtbo dtbo.img
 fastboot flash vendor_boot vendor_boot.img
-fastboot flash --disable-verity --disable-verification vbmeta vbmeta.img
+fastboot flash vbmeta vbmeta.img
+
+echo [-] Rebooting into userspace fastbootd...
 fastboot reboot fastboot
+timeout /t 5 /nobreak >nul
+
+echo [-] Flashing dynamic system partitions...
 fastboot flash system system.img
 fastboot flash product product.img
 fastboot flash system_ext system_ext.img
 fastboot flash vendor vendor.img
-echo [+] Flash complete. Wipe userdata if performing first-time install: fastboot -w
-echo [+] Rebooting to Cockpit OS...
+
+echo [-] Wiping userdata for clean appliance launch...
+fastboot -w
+
+echo =================================================
+echo [+] MotoCockpit OS flash complete!
+echo [+] Rebooting into Cockpit OS...
+echo =================================================
 fastboot reboot
 pause
 EOF
 
 cd "${WORKDIR}"
+rm -f "${OUTDIR}/${PACKAGE_NAME}.zip" "${OUTDIR}/${PACKAGE_NAME}.zip.sha256"
 zip -r "${OUTDIR}/${PACKAGE_NAME}.zip" "${PACKAGE_NAME}"
 
 cd "${OUTDIR}"
@@ -248,4 +355,3 @@ echo "    MotoCockpit OS Package Created Successfully!        "
 echo "    Artifact: ${OUTDIR}/${PACKAGE_NAME}.zip             "
 echo "    SHA256:   $(cat "${OUTDIR}/${PACKAGE_NAME}.zip.sha256")"
 echo "========================================================"
-

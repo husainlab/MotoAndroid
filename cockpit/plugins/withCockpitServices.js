@@ -54,6 +54,32 @@ module.exports = function withCockpitServices(config) {
       });
     }
 
+    // Configure Cockpit MainActivity as Default System Launcher (HOME Category)
+    const mainActivity = app.activity?.find(
+      (a) => a.$['android:name'] === '.MainActivity'
+    );
+    if (mainActivity) {
+      mainActivity['intent-filter'] = mainActivity['intent-filter'] || [];
+      const mainFilter = mainActivity['intent-filter'].find((filter) =>
+        filter.action?.some((a) => a.$['android:name'] === 'android.intent.action.MAIN')
+      );
+      if (mainFilter) {
+        mainFilter.category = mainFilter.category || [];
+        const requiredCategories = [
+          'android.intent.category.LAUNCHER',
+          'android.intent.category.HOME',
+          'android.intent.category.DEFAULT',
+        ];
+        for (const cat of requiredCategories) {
+          if (!mainFilter.category.some((c) => c.$['android:name'] === cat)) {
+            mainFilter.category.push({
+              $: { 'android:name': cat },
+            });
+          }
+        }
+      }
+    }
+
     return mod;
   });
 };

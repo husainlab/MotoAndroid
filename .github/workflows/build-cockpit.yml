@@ -3,6 +3,7 @@ name: Build MotoCockpit OS
 on:
   push:
     paths:
+      - 'cockpit/**'
       - 'config/**'
       - 'device/**'
       - 'scripts/**'
@@ -34,12 +35,72 @@ jobs:
           sudo docker system prune -af || true
           df -h
 
-      - name: Install Tooling Dependencies
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.1
+          package_json_file: cockpit/package.json
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: cockpit/pnpm-lock.yaml
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 platforms;android-36 build-tools;37.0.0
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Tooling Dependencies for ROM Reshaping
         run: |
           sudo apt-get update -y
           sudo apt-get install -y erofs-utils e2fsprogs android-sdk-libsparse-utils curl zip jq
           # Install payload-dumper-go
           curl -sL "https://github.com/ssut/payload-dumper-go/releases/download/2.1.0/payload-dumper-go_2.1.0_linux_amd64.tar.gz" | sudo tar -xz -C /usr/local/bin
+
+      - name: Install Cockpit dependencies
+        working-directory: cockpit
+        run: pnpm install --frozen-lockfile
+
+      - name: Prebuild Cockpit Android (CNG)
+        working-directory: cockpit
+        run: |
+          echo '/// <reference types="expo/types" />' > expo-env.d.ts
+          npx expo prebuild --platform android --clean
+
+      - name: Build signed release APK
+        working-directory: cockpit/android
+        env:
+          RELEASE_STORE_FILE: ${{ github.workspace }}/cockpit/credentials/release.keystore
+          RELEASE_STORE_PASSWORD: Pillion_c7f0c1ca5b2dfcde602c
+          RELEASE_KEY_ALIAS: pillion-release
+          RELEASE_KEY_PASSWORD: Pillion_c7f0c1ca5b2dfcde602c
+          ORG_GRADLE_PROJECT_reactNativeArchitectures: arm64-v8a
+          GRADLE_OPTS: -Xmx4096m -XX:MaxMetaspaceSize=1024m -Dorg.gradle.jvmargs=-Xmx4096m -Dorg.gradle.workers.max=2 -Dorg.gradle.parallel=true
+        run: ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a
+
+      - name: Stage Cockpit APK for Reshaping Pipeline
+        run: |
+          mkdir -p build_workdir/prebuilt
+          APK_FILE=$(find cockpit/android/app/build/outputs/apk/release -name "*.apk" ! -name "*unsigned*" | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::No signed release APK found."
+            exit 1
+          fi
+          echo "[+] Staging $APK_FILE to build_workdir/prebuilt/Cockpit.apk"
+          cp "$APK_FILE" build_workdir/prebuilt/Cockpit.apk
+          ls -lh build_workdir/prebuilt/Cockpit.apk
 
       - name: Run ROM Reshaping Pipeline
         run: |
@@ -59,17 +120,17 @@ jobs:
           RELEASE_TITLE="MotoCockpit OS ${TAG_NAME}"
           NOTES="### MotoCockpit OS for Motorola Moto G52 (rhode)
           
-          * **Base:** Official LineageOS Android 14 / 21
-          * **Embedded Cockpit:** Cockpit Receiver Appliance
-          * **Hardware Tuning:** 60Hz AMOLED lock, 3GB zstd ZRAM, Wi-Fi & Bluetooth-only mode
-          * **Debloated:** All telephony/SMS bloat, Aperture camera, Eleven music, and stock trackers removed.
+          * **Base:** Official LineageOS 24.0 (Android 17, SDK 37)
+          * **Appliance Launcher:** Embedded Cockpit Receiver as default system HOME (zero setup wizard)
+          * **Thermal & Hardware Tuning:** 60Hz AMOLED lock, cellular modem disabled (Wi-Fi/Bluetooth only), LMKD foreground priority
+          * **Aggressively Debloated:** SetupWizard, Trebuchet, Telephony/SMS bloat, Aperture camera, and Lineage updater purged.
           
-          #### Installation:
-          1. Extract the downloaded \`MotoCockpit-OS-*.zip\`.
-          2. Reboot Moto G52 into Fastboot mode (\`adb reboot bootloader\`).
-          3. Run \`./flash-all.sh\` (Mac/Linux) or \`flash-all.bat\` (Windows)."
+          #### Installation (Fastboot):
+          1. Extract the downloaded \`MotoCockpit-OS-v1.0.0-rhode.zip\`.
+          2. Connect Motorola Moto G52 in Bootloader mode (\`adb reboot bootloader\` or Volume Down + Power).
+          3. Run \`./flash-all.sh\` (Mac/Linux) or \`flash-all.bat\` (Windows).
+          4. Device will automatically flash partitions, wipe userdata, and boot directly into Cockpit."
 
-          gh release create "${TAG_NAME}" out/*.zip out/*.sha256 \
+          gh release create "${TAG_NAME}" out/*.zip out/*.sha256 build_workdir/prebuilt/Cockpit.apk \
             --title "${RELEASE_TITLE}" \
             --notes "${NOTES}"
-
