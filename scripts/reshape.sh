@@ -54,7 +54,7 @@ unzip -p "${ZIP_FILENAME}" payload.bin > payload.bin
 echo "[-] Extracting partition images via payload-dumper-go..."
 if ! command -v payload-dumper-go &> /dev/null; then
     echo "[-] Installing payload-dumper-go..."
-    curl -sL "https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz" | tar -xz -C /usr/local/bin
+    curl -sL "https://github.com/ssut/payload-dumper-go/releases/download/2.1.0/payload-dumper-go_2.1.0_linux_amd64.tar.gz" | sudo tar -xz -C /usr/local/bin
 fi
 
 payload-dumper-go -o extracted_images payload.bin
@@ -77,7 +77,6 @@ fi
 # 4. Modify System & Product Partitions
 # ------------------------------------------------------------------------------
 echo "[-] Preparing partition modification environment..."
-sudo apt-get update -y && sudo apt-get install -y erofs-utils e2fsprogs simg2img img2simg
 
 modify_partition() {
     local PART_NAME="$1"
@@ -98,7 +97,13 @@ modify_partition() {
 
     if [[ "${FS_TYPE}" == "erofs" ]] || file "${IMG_FILE}" | grep -q "erofs"; then
         echo "[+] Detected EROFS filesystem on ${PART_NAME}."
-        extract.erofs -i "${IMG_FILE}" -x "${EXTRACT_DIR}"
+        if command -v fsck.erofs &>/dev/null; then
+            fsck.erofs --extract="${EXTRACT_DIR}" "${IMG_FILE}" || true
+        elif command -v extract.erofs &>/dev/null; then
+            extract.erofs -i "${IMG_FILE}" -x "${EXTRACT_DIR}" || true
+        else
+            echo "[!] No EROFS extraction tool found."
+        fi
         
         # Apply Modifications
         apply_partition_mods "${PART_NAME}" "${EXTRACT_DIR}"
